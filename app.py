@@ -123,16 +123,37 @@ if page == "➕ Registrar":
     with colA:
         # Botón rápido: quién está cargando
         st.caption("¿Quién está cargando ahora?")
-        who_am_i = st.radio("", ["Juan", "Mailu"], horizontal=True, index=0)
+        who_am_i = st.radio(
+    "¿Quién está cargando ahora?",
+    ["Juan", "Mailu"],
+    horizontal=True,
+    index=0,
+    key="who_am_i_radio",
+    label_visibility="collapsed",
+)
     with colB:
         dt = st.date_input("Fecha", pd.Timestamp.now().date())
 
     # Permitir cargar gastos del otro:
     st.write("**¿Quién pagó?**")
-    paid_by = st.radio("", ["Juan", "Mailu"], horizontal=True, index=0)
+    paid_by = st.radio(
+    "¿Quién pagó?",
+    ["Juan", "Mailu"],
+    horizontal=True,
+    index=0,
+    key="paid_by_radio",
+    label_visibility="collapsed",
+)
 
     st.write("**¿Para quién fue?**")
-    paid_for = st.radio("", ["Ambos", "Juan", "Mailu"], horizontal=True, index=0)
+    paid_for = st.radio(
+    "¿Para quién fue?",
+    ["Ambos", "Juan", "Mailu"],
+    horizontal=True,
+    index=0,
+    key="paid_for_radio",
+    label_visibility="collapsed",
+)
 
     mtype = st.selectbox("Tipo", ["gasto", "ingreso"])
     cat = st.selectbox("Categoría", categories)
