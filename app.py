@@ -1,3 +1,133 @@
+# Dreamteam v2 – full app
+import streamlit as st
+import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
+
+st.set_page_config(page_title="Dreamteam v2", page_icon="💸", layout="centered")
+
+# ---------- CONFIG / AUTH ----------
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+@st.cache_resource
+def get_gspread_client():
+    info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(info, scopes=SCOPE)
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def open_sheet():
+    gc = get_gspread_client()
+    sh = gc.open_by_key(st.secrets["general"]["sheet_id"])
+    return {
+        "sh": sh,
+        "tx": sh.worksheet("transactions"),
+        "cfg": sh.worksheet("config"),
+        "cat": sh.worksheet("categories"),
+    }
+
+def ensure_headers(ws, headers):
+    existing = ws.row_values(1)
+    if existing != headers:
+        ws.clear()
+        ws.append_row(headers)
+
+def read_config(cfg_ws):
+    data = cfg_ws.get_all_records()
+    cfg = {row["key"]: row["value"] for row in data}
+    sj = float(cfg.get("split_juan", 0.6))
+    sm = float(cfg.get("split_mailu", 0.4))
+    return sj, sm
+
+def read_categories(cat_ws):
+    # 1ª columna como categoría
+    values = cat_ws.get_all_values()
+    cats = [r[0] for r in values if r and str(r[0]).strip()]
+    return cats if cats else ["Ingresos", "Supermercado", "Comidas"]
+
+def read_transactions(tx_ws):
+    vals = tx_ws.get_all_values()
+    if not vals or len(vals) < 2:
+        # columnas por defecto (con las nuevas incluidas)
+        return pd.DataFrame(columns=[
+            "timestamp","entry_user","paid_by","paid_for","type","category",
+            "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
+        ])
+    df = pd.DataFrame(vals[1:], columns=vals[0])
+
+    # Tipados
+    for col in ["amount", "amount_juan", "amount_mailu", "split_juan", "split_mailu"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    return df
+
+def append_transaction(tx_ws, row_dict):
+    """Inserta en el orden exacto de headers presentes en la hoja."""
+    headers = tx_ws.row_values(1)
+    ordered = [row_dict.get(h, "") for h in headers]
+    tx_ws.append_row(ordered)
+
+# ---------- DEUDA / SPLIT ----------
+def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
+    g = df[df["type"].str.lower() == "gasto"].copy()
+    if g.empty:
+        return 0.0, 0.0, 0.0
+
+    # Usa split por gasto si está presente; si no, usa el de config
+    def owed_parts(row):
+        amt = float(row["amount"])
+        pf = str(row.get("paid_for", "")).lower()
+
+        # Si la transacción tiene split por gasto, úsalo cuando sea "Ambos"
+        sj = row.get("split_juan")
+        sm = row.get("split_mailu")
+        if pd.notna(sj) and pd.notna(sm) and pf == "ambos":
+            return amt * float(sj), amt * float(sm)
+
+        # Si no hay split por gasto, usa reglas clásicas
+        if pf == "ambos":
+            return amt * default_split_juan, amt * default_split_mailu
+        elif pf == "juan":
+            return amt, 0.0
+        elif pf == "mailu":
+            return 0.0, amt
+        return amt * default_split_juan, amt * default_split_mailu
+
+    g["owed_juan"], g["owed_mailu"] = zip(*g.apply(owed_parts, axis=1))
+    g["paid_by_juan"] = (g["paid_by"].str.lower() == "juan").astype(float) * g["amount"]
+    g["paid_by_mailu"] = (g["paid_by"].str.lower() == "mailu").astype(float) * g["amount"]
+
+    juan_net = g["paid_by_juan"].sum() - g["owed_juan"].sum()
+    mailu_net = g["paid_by_mailu"].sum() - g["owed_mailu"].sum()
+    mailu_owes_juan = max(0.0, juan_net)
+    return juan_net, mailu_net, mailu_owes_juan
+
+# ---------- BOOTSTRAP ----------
+sheets = open_sheet()
+tx_ws = sheets["tx"]
+cfg_ws = sheets["cfg"]
+cat_ws = sheets["cat"]
+
+# Encabezados de transactions (incluye nuevas columnas)
+TX_HEADERS = [
+    "timestamp","entry_user","paid_by","paid_for","type","category",
+    "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
+]
+ensure_headers(tx_ws, TX_HEADERS)
+
+split_juan, split_mailu = read_config(cfg_ws)
+categories = read_categories(cat_ws)
+
+# ---------- NAV ----------
+page = st.sidebar.radio("Navegación", ["➕ Registrar", "📊 Dashboard", "⚙️ Config"])
+
+# ---------- REGISTRAR ----------
 if page == "➕ Registrar":
     st.subheader("Nuevo movimiento")
 
@@ -15,7 +145,6 @@ if page == "➕ Registrar":
     with colB:
         dt = st.date_input("Fecha", pd.Timestamp.now().date())
 
-    # --- Pagador y destinatario ---
     st.write("**¿Quién pagó?**")
     paid_by = st.radio(
         "¿Quién pagó?",
@@ -36,42 +165,52 @@ if page == "➕ Registrar":
         label_visibility="collapsed",
     )
 
-    # ---- Distribución del gasto ----
+    # ---- Split por gasto (slider + input sincronizados) ----
     st.markdown("### 💰 Distribución del gasto")
 
-    # Base dinámica según quién pagó
-    is_juan_payer = paid_by == "Juan"
+    is_juan_payer = (paid_by == "Juan")
+    base_val = int(split_juan * 100) if is_juan_payer else int((1 - split_juan) * 100)
+
+    # state inicial según quién paga
+    if "split_value" not in st.session_state:
+        st.session_state.split_value = base_val
+    if "last_payer" not in st.session_state:
+        st.session_state.last_payer = paid_by
+    # si cambió el pagador, resetea base
+    if st.session_state.last_payer != paid_by:
+        st.session_state.last_payer = paid_by
+        st.session_state.split_value = base_val
 
     col1, col2, col3 = st.columns([3, 1, 2])
-
-    # Slider principal
     with col1:
-        base_val = int(split_juan * 100) if is_juan_payer else int((1 - split_juan) * 100)
-        perc_value = st.slider(
+        st.slider(
             f"{'Juan' if is_juan_payer else 'Mailu'} (%)",
-            min_value=0,
-            max_value=100,
-            value=base_val,
+            min_value=0, max_value=100,
+            value=st.session_state.split_value,
             step=1,
             key="split_slider",
             label_visibility="collapsed",
         )
-
-    # Input manual sincronizado
     with col2:
-        perc_input = st.number_input(
+        st.number_input(
             "Editar %",
-            min_value=0,
-            max_value=100,
-            value=perc_value,
+            min_value=0, max_value=100,
+            value=st.session_state.split_value,
             step=1,
             key="split_input",
             label_visibility="collapsed",
         )
-        if perc_input != perc_value:
-            perc_value = perc_input
 
-    # Cálculo dinámico según quién pagó
+    # sincronización inmediata
+    if st.session_state.split_slider != st.session_state.split_value:
+        st.session_state.split_value = st.session_state.split_slider
+        st.rerun()
+    if st.session_state.split_input != st.session_state.split_value:
+        st.session_state.split_value = st.session_state.split_input
+        st.rerun()
+
+    perc_value = st.session_state.split_value
+
     if is_juan_payer:
         perc_juan = perc_value
         perc_mailu = 100 - perc_juan
@@ -79,43 +218,28 @@ if page == "➕ Registrar":
         perc_mailu = perc_value
         perc_juan = 100 - perc_mailu
 
-    # Mostrar ambos valores
     with col3:
         st.markdown(
-            f"""
-            <div style='text-align:left; line-height:1.4'>
-                <b>Juan:</b> {perc_juan}%<br>
-                <b>Mailu:</b> {perc_mailu}%
-            </div>
-            """,
+            f"<div style='text-align:left; line-height:1.4'>"
+            f"<b>Juan:</b> {perc_juan}%<br>"
+            f"<b>Mailu:</b> {perc_mailu}%"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
     # ---- Tipo, categoría, monto y notas ----
     st.markdown("### 📂 Tipo y categoría")
-
-    mtype = st.selectbox(
-        "Tipo",
-        ["gasto", "ingreso"],
-        index=0,
-        key="mtype_select"
-    )
-
-    cat = st.selectbox(
-        "Categoría",
-        categories,  # usa tu lista dinámica desde Google Sheets
-        index=0,
-        key="cat_select"
-    )
+    mtype = st.selectbox("Tipo", ["gasto", "ingreso"], index=0, key="mtype_select")
+    cat = st.selectbox("Categoría", categories, index=0, key="cat_select")
 
     amount = st.number_input("Monto", min_value=0.0, step=0.01, format="%.2f")
     notes = st.text_area("Notas")
 
-    # ---- Guardar movimiento ----
+    # ---- Guardar ----
     if st.button("Guardar ✅", use_container_width=True):
         ts = datetime.combine(dt, datetime.min.time())
-        amount_juan = amount * (perc_juan / 100)
-        amount_mailu = amount * (perc_mailu / 100)
+        amount_juan = float(amount) * (perc_juan / 100)
+        amount_mailu = float(amount) * (perc_mailu / 100)
 
         row = {
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
@@ -131,9 +255,75 @@ if page == "➕ Registrar":
             "amount_juan": amount_juan,
             "amount_mailu": amount_mailu,
         }
-
-        tx_ws.append_row(list(row.values()))
+        append_transaction(tx_ws, row)
         st.success("Movimiento registrado ✅")
 
     st.divider()
     st.caption("Tip: Podés agregar o quitar categorías desde la pestaña `categories` en el Sheet.")
+
+# ---------- DASHBOARD ----------
+elif page == "📊 Dashboard":
+    st.subheader("Resumen mensual")
+    df = read_transactions(tx_ws)
+    if df.empty:
+        st.info("Aún no hay movimientos.")
+    else:
+        months = sorted(df["timestamp"].dt.to_period("M").astype(str).unique())
+        month = st.selectbox("Mes", months, index=len(months)-1)
+        y, m = map(int, month.split("-"))
+        dff = df[(df["timestamp"].dt.year == y) & (df["timestamp"].dt.month == m)].copy()
+
+        gastos = dff[dff["type"].str.lower() == "gasto"]["amount"].sum()
+        ingresos = dff[dff["type"].str.lower() == "ingreso"]["amount"].sum()
+        ahorro = ingresos - gastos
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Gastos del mes", f"${gastos:,.0f}")
+        c2.metric("Ingresos del mes", f"${ingresos:,.0f}")
+        c3.metric("Ahorro (ingresos - gastos)", f"${ahorro:,.0f}")
+
+        juan_net, mailu_net, mailu_owes_juan = compute_debt(
+            df, default_split_juan=split_juan, default_split_mailu=split_mailu
+        )
+        if mailu_owes_juan > 0:
+            st.success(f"💚 Mailu le debe a Juan: **${mailu_owes_juan:,.0f}**")
+        elif juan_net < 0:
+            st.success(f"💚 Juan le debe a Mailu: **${abs(juan_net):,.0f}**")
+        else:
+            st.info("⚖️ Están a mano.")
+
+        st.divider()
+        g_mes = (
+            dff[dff["type"].str.lower() == "gasto"]
+            .groupby("category", as_index=False)["amount"]
+            .sum()
+            .sort_values("amount", ascending=False)
+        )
+        if not g_mes.empty:
+            st.bar_chart(g_mes.set_index("category"))
+        else:
+            st.caption("No hay gastos este mes.")
+
+        st.divider()
+        st.write("Últimos movimientos del mes")
+        show = dff.sort_values("timestamp", ascending=False)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+# ---------- CONFIG ----------
+elif page == "⚙️ Config":
+    st.subheader("Split de gastos")
+    st.caption("También podés editar esto directamente en la pestaña `config` del Sheet.")
+    sj = st.number_input("Split Juan (proporción)", min_value=0.0, max_value=1.0, step=0.05, value=float(split_juan))
+    sm = st.number_input("Split Mailu (proporción)", min_value=0.0, max_value=1.0, step=0.05, value=float(split_mailu))
+    if abs((sj + sm) - 1.0) > 1e-9:
+        st.error("La suma debe ser 1.0 (100%).")
+    else:
+        if st.button("Guardar split", use_container_width=True, key="save_cfg_btn"):
+            cfg_ws.update("A1:B3", [
+                ["key","value"],
+                ["split_juan", sj],
+                ["split_mailu", sm]
+            ])
+            st.success("Split actualizado.")
+    st.divider()
+    st.caption("Categorías: editá libremente la pestaña `categories` del Sheet (una por fila).")
