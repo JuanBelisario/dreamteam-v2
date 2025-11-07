@@ -154,26 +154,38 @@ if page == "➕ Registrar":
     key="paid_for_radio",
     label_visibility="collapsed",
 )
-     # ---- Split personalizado por gasto ----
-st.write("**Distribución del gasto**")
-colj, colm = st.columns(2)
-with colj:
+# ---- Split personalizado por gasto ----
+st.markdown("### 💰 Distribución del gasto")
+
+col1, col2, col3 = st.columns([3, 1, 1])
+
+with col1:
     perc_juan = st.slider(
         "Juan (%)",
         min_value=0,
         max_value=100,
         value=int(split_juan * 100),
-        step=5,
-        key="juan_pct",
+        step=1,
+        key="juan_pct_slider",
+        label_visibility="collapsed",
     )
-with colm:
+
+with col2:
+    perc_input = st.number_input(
+        "Editar %",
+        min_value=0,
+        max_value=100,
+        value=perc_juan,
+        step=1,
+        key="juan_pct_input",
+        label_visibility="collapsed",
+    )
+    if perc_input != perc_juan:
+        perc_juan = perc_input  # sincroniza manual con slider
+
+with col3:
     perc_mailu = 100 - perc_juan
-    st.metric("Mailu (%)", f"{perc_mailu}%")
-    
-    mtype = st.selectbox("Tipo", ["gasto", "ingreso"])
-    cat = st.selectbox("Categoría", categories)
-    amount = st.number_input("Monto", min_value=0.0, step=100.0, format="%.2f")
-    notes = st.text_input("Notas", "")
+    st.metric(label="Mailu (%)", value=f"{perc_mailu}%", label_visibility="visible")
 
 if st.button("Guardar ✅", use_container_width=True):
     ts = datetime.combine(dt, datetime.min.time())
