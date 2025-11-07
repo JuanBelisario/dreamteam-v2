@@ -175,7 +175,7 @@ with colm:
     amount = st.number_input("Monto", min_value=0.0, step=100.0, format="%.2f")
     notes = st.text_input("Notas", "")
 
-    if st.button("Guardar ✅", use_container_width=True):
+if st.button("Guardar ✅", use_container_width=True):
     ts = datetime.combine(dt, datetime.min.time())
     amount_juan = amount * (perc_juan / 100)
     amount_mailu = amount * (perc_mailu / 100)
@@ -192,8 +192,9 @@ with colm:
         "split_juan": perc_juan / 100,
         "split_mailu": perc_mailu / 100,
         "amount_juan": amount_juan,
-        "amount_mailu": amount_mailu
+        "amount_mailu": amount_mailu,
     }
+
     append_transaction(row)
     st.success("Movimiento registrado.")
 
