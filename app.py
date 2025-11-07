@@ -1,4 +1,4 @@
-# Dreamteam v2 – Optimized Fast Load (no dashboard, no charts)
+# Dreamteam v2 – Optimized Fast Load (with cache fix)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -60,35 +60,37 @@ def ensure_headers(ws, headers):
         except Exception:
             pass
 
+# ---------- DATA LOADERS (CACHE FIX) ----------
+@st.cache_data(ttl=300)
+def read_config_data(cfg_values):
+    """Lee config desde lista cacheable (no Worksheet)."""
+    if not cfg_values or len(cfg_values) < 2:
+        return 0.6, 0.4
+    df = pd.DataFrame(cfg_values[1:], columns=cfg_values[0])
+    cfg = dict(zip(df["key"], df["value"]))
+    sj = float(cfg.get("split_juan", 0.6))
+    sm = float(cfg.get("split_mailu", 0.4))
+    return sj, sm
+
+@st.cache_data(ttl=300)
+def read_categories_data(cat_values):
+    cats = [r[0] for r in cat_values if r and str(r[0]).strip()]
+    return cats if cats else ["Ingresos", "Supermercado", "Comidas"]
+
 @st.cache_data(ttl=60)
-def read_transactions(tx_ws):
-    vals = tx_ws.get_all_values()
-    if not vals or len(vals) < 2:
+def read_transactions_data(tx_values):
+    if not tx_values or len(tx_values) < 2:
         return pd.DataFrame(columns=[
             "timestamp","entry_user","paid_by","paid_for","type","category",
             "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
         ])
-    df = pd.DataFrame(vals[1:], columns=vals[0])
+    df = pd.DataFrame(tx_values[1:], columns=tx_values[0])
     for col in ["amount", "amount_juan", "amount_mailu", "split_juan", "split_mailu"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     return df
-
-@st.cache_data(ttl=300)
-def read_config(cfg_ws):
-    data = cfg_ws.get_all_records()
-    cfg = {row["key"]: row["value"] for row in data}
-    sj = float(cfg.get("split_juan", 0.6))
-    sm = float(cfg.get("split_mailu", 0.4))
-    return sj, sm
-
-@st.cache_data(ttl=300)
-def read_categories(cat_ws):
-    values = cat_ws.get_all_values()
-    cats = [r[0] for r in values if r and str(r[0]).strip()]
-    return cats if cats else ["Ingresos", "Supermercado", "Comidas"]
 
 def append_transaction(tx_ws, row_dict):
     headers = _retry(lambda: tx_ws.row_values(1))
@@ -138,15 +140,20 @@ if "tx_headers_ok" not in st.session_state:
     ensure_headers(tx_ws, TX_HEADERS)
     st.session_state["tx_headers_ok"] = True
 
-split_juan, split_mailu = read_config(cfg_ws)
-categories = read_categories(cat_ws)
+# ---- Load data safely (now cached by value) ----
+cfg_values = cfg_ws.get_all_values()
+cat_values = cat_ws.get_all_values()
+tx_values = tx_ws.get_all_values()
+
+split_juan, split_mailu = read_config_data(cfg_values)
+categories = read_categories_data(cat_values)
+df = read_transactions_data(tx_values)
 
 # ---------- REGISTRAR ----------
 st.title("💸 Dreamteam v2")
 st.subheader("Nuevo movimiento")
 
 # Mostrar balance global arriba
-df = read_transactions(tx_ws)
 juan_net, mailu_net, mailu_owes_juan = compute_debt(df, split_juan, split_mailu)
 if mailu_owes_juan > 0:
     st.success(f"💚 Mailu le debe a Juan: **${mailu_owes_juan:,.0f}**")
