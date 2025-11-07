@@ -1,7 +1,9 @@
-# Dreamteam v2 – full app
+# Dreamteam v2 – full stable version (with sync & API fixes)
 import streamlit as st
 import pandas as pd
 import gspread
+import time
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
@@ -23,6 +25,14 @@ def get_gspread_client():
 def open_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(st.secrets["general"]["sheet_id"])
+    # Asegura existencia de worksheets
+    titles = [w.title for w in sh.worksheets()]
+    if "transactions" not in titles:
+        sh.add_worksheet("transactions", rows=1000, cols=12)
+    if "config" not in titles:
+        sh.add_worksheet("config", rows=10, cols=2)
+    if "categories" not in titles:
+        sh.add_worksheet("categories", rows=50, cols=1)
     return {
         "sh": sh,
         "tx": sh.worksheet("transactions"),
@@ -30,11 +40,31 @@ def open_sheet():
         "cat": sh.worksheet("categories"),
     }
 
+# ---------- UTILS ----------
+def _retry(fn, tries=3, delay=0.6):
+    """Retry wrapper for gspread API calls"""
+    for i in range(tries):
+        try:
+            return fn()
+        except APIError as e:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+
 def ensure_headers(ws, headers):
-    existing = ws.row_values(1)
-    if existing != headers:
-        ws.clear()
-        ws.append_row(headers)
+    """Verifica encabezados sin borrar la hoja"""
+    try:
+        existing = _retry(lambda: ws.row_values(1))
+    except Exception as e:
+        st.warning(f"No se pudo leer encabezados de 'transactions': {e}")
+        return
+
+    if not existing or existing != headers:
+        try:
+            _retry(lambda: ws.update("A1", [headers]))
+            st.info("Encabezados de 'transactions' verificados/ajustados ✅")
+        except Exception as e:
+            st.error(f"Error al actualizar encabezados: {e}")
 
 def read_config(cfg_ws):
     data = cfg_ws.get_all_records()
@@ -44,7 +74,6 @@ def read_config(cfg_ws):
     return sj, sm
 
 def read_categories(cat_ws):
-    # 1ª columna como categoría
     values = cat_ws.get_all_values()
     cats = [r[0] for r in values if r and str(r[0]).strip()]
     return cats if cats else ["Ingresos", "Supermercado", "Comidas"]
@@ -52,14 +81,11 @@ def read_categories(cat_ws):
 def read_transactions(tx_ws):
     vals = tx_ws.get_all_values()
     if not vals or len(vals) < 2:
-        # columnas por defecto (con las nuevas incluidas)
         return pd.DataFrame(columns=[
             "timestamp","entry_user","paid_by","paid_for","type","category",
             "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
         ])
     df = pd.DataFrame(vals[1:], columns=vals[0])
-
-    # Tipados
     for col in ["amount", "amount_juan", "amount_mailu", "split_juan", "split_mailu"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -68,10 +94,9 @@ def read_transactions(tx_ws):
     return df
 
 def append_transaction(tx_ws, row_dict):
-    """Inserta en el orden exacto de headers presentes en la hoja."""
-    headers = tx_ws.row_values(1)
+    headers = _retry(lambda: tx_ws.row_values(1))
     ordered = [row_dict.get(h, "") for h in headers]
-    tx_ws.append_row(ordered)
+    _retry(lambda: tx_ws.append_row(ordered, value_input_option="USER_ENTERED"))
 
 # ---------- DEUDA / SPLIT ----------
 def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
@@ -79,18 +104,13 @@ def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
     if g.empty:
         return 0.0, 0.0, 0.0
 
-    # Usa split por gasto si está presente; si no, usa el de config
     def owed_parts(row):
         amt = float(row["amount"])
         pf = str(row.get("paid_for", "")).lower()
-
-        # Si la transacción tiene split por gasto, úsalo cuando sea "Ambos"
         sj = row.get("split_juan")
         sm = row.get("split_mailu")
         if pd.notna(sj) and pd.notna(sm) and pf == "ambos":
             return amt * float(sj), amt * float(sm)
-
-        # Si no hay split por gasto, usa reglas clásicas
         if pf == "ambos":
             return amt * default_split_juan, amt * default_split_mailu
         elif pf == "juan":
@@ -102,7 +122,6 @@ def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
     g["owed_juan"], g["owed_mailu"] = zip(*g.apply(owed_parts, axis=1))
     g["paid_by_juan"] = (g["paid_by"].str.lower() == "juan").astype(float) * g["amount"]
     g["paid_by_mailu"] = (g["paid_by"].str.lower() == "mailu").astype(float) * g["amount"]
-
     juan_net = g["paid_by_juan"].sum() - g["owed_juan"].sum()
     mailu_net = g["paid_by_mailu"].sum() - g["owed_mailu"].sum()
     mailu_owes_juan = max(0.0, juan_net)
@@ -114,12 +133,14 @@ tx_ws = sheets["tx"]
 cfg_ws = sheets["cfg"]
 cat_ws = sheets["cat"]
 
-# Encabezados de transactions (incluye nuevas columnas)
 TX_HEADERS = [
     "timestamp","entry_user","paid_by","paid_for","type","category",
     "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
 ]
-ensure_headers(tx_ws, TX_HEADERS)
+
+if "tx_headers_ok" not in st.session_state:
+    ensure_headers(tx_ws, TX_HEADERS)
+    st.session_state["tx_headers_ok"] = True
 
 split_juan, split_mailu = read_config(cfg_ws)
 categories = read_categories(cat_ws)
@@ -130,7 +151,6 @@ page = st.sidebar.radio("Navegación", ["➕ Registrar", "📊 Dashboard", "⚙�
 # ---------- REGISTRAR ----------
 if page == "➕ Registrar":
     st.subheader("Nuevo movimiento")
-
     colA, colB = st.columns(2)
     with colA:
         st.caption("¿Quién está cargando ahora?")
@@ -165,51 +185,50 @@ if page == "➕ Registrar":
         label_visibility="collapsed",
     )
 
-    # ---- Split por gasto (slider + input sincronizados) ----
+    # ---- Split por gasto (slider + input sincronizados, sin rerun) ----
     st.markdown("### 💰 Distribución del gasto")
 
     is_juan_payer = (paid_by == "Juan")
     base_val = int(split_juan * 100) if is_juan_payer else int((1 - split_juan) * 100)
 
-    # state inicial según quién paga
-    if "split_value" not in st.session_state:
-        st.session_state.split_value = base_val
-    if "last_payer" not in st.session_state:
-        st.session_state.last_payer = paid_by
-    # si cambió el pagador, resetea base
-    if st.session_state.last_payer != paid_by:
-        st.session_state.last_payer = paid_by
-        st.session_state.split_value = base_val
+    sv_key = "split_value"
+    if sv_key not in st.session_state:
+        st.session_state[sv_key] = base_val
+
+    last_key = "last_payer"
+    if last_key not in st.session_state:
+        st.session_state[last_key] = paid_by
+    if st.session_state[last_key] != paid_by:
+        st.session_state[last_key] = paid_by
+        st.session_state[sv_key] = base_val
 
     col1, col2, col3 = st.columns([3, 1, 2])
     with col1:
-        st.slider(
+        slider_val = st.slider(
             f"{'Juan' if is_juan_payer else 'Mailu'} (%)",
             min_value=0, max_value=100,
-            value=st.session_state.split_value,
+            value=st.session_state[sv_key],
             step=1,
-            key="split_slider",
+            key=f"split_slider_{'J' if is_juan_payer else 'M'}",
             label_visibility="collapsed",
         )
+
     with col2:
-        st.number_input(
+        input_val = st.number_input(
             "Editar %",
             min_value=0, max_value=100,
-            value=st.session_state.split_value,
+            value=st.session_state[sv_key],
             step=1,
-            key="split_input",
+            key=f"split_input_{'J' if is_juan_payer else 'M'}",
             label_visibility="collapsed",
         )
 
-    # sincronización inmediata
-    if st.session_state.split_slider != st.session_state.split_value:
-        st.session_state.split_value = st.session_state.split_slider
-        st.rerun()
-    if st.session_state.split_input != st.session_state.split_value:
-        st.session_state.split_value = st.session_state.split_input
-        st.rerun()
+    if input_val != st.session_state[sv_key]:
+        st.session_state[sv_key] = input_val
+    elif slider_val != st.session_state[sv_key]:
+        st.session_state[sv_key] = slider_val
 
-    perc_value = st.session_state.split_value
+    perc_value = st.session_state[sv_key]
 
     if is_juan_payer:
         perc_juan = perc_value
@@ -235,7 +254,6 @@ if page == "➕ Registrar":
     amount = st.number_input("Monto", min_value=0.0, step=0.01, format="%.2f")
     notes = st.text_area("Notas")
 
-    # ---- Guardar ----
     if st.button("Guardar ✅", use_container_width=True):
         ts = datetime.combine(dt, datetime.min.time())
         amount_juan = float(amount) * (perc_juan / 100)
@@ -282,9 +300,7 @@ elif page == "📊 Dashboard":
         c2.metric("Ingresos del mes", f"${ingresos:,.0f}")
         c3.metric("Ahorro (ingresos - gastos)", f"${ahorro:,.0f}")
 
-        juan_net, mailu_net, mailu_owes_juan = compute_debt(
-            df, default_split_juan=split_juan, default_split_mailu=split_mailu
-        )
+        juan_net, mailu_net, mailu_owes_juan = compute_debt(df, split_juan, split_mailu)
         if mailu_owes_juan > 0:
             st.success(f"💚 Mailu le debe a Juan: **${mailu_owes_juan:,.0f}**")
         elif juan_net < 0:
@@ -306,24 +322,18 @@ elif page == "📊 Dashboard":
 
         st.divider()
         st.write("Últimos movimientos del mes")
-        show = dff.sort_values("timestamp", ascending=False)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(dff.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
 
 # ---------- CONFIG ----------
 elif page == "⚙️ Config":
     st.subheader("Split de gastos")
     st.caption("También podés editar esto directamente en la pestaña `config` del Sheet.")
-    sj = st.number_input("Split Juan (proporción)", min_value=0.0, max_value=1.0, step=0.05, value=float(split_juan))
-    sm = st.number_input("Split Mailu (proporción)", min_value=0.0, max_value=1.0, step=0.05, value=float(split_mailu))
+    sj = st.number_input("Split Juan (proporción)", 0.0, 1.0, float(split_juan), 0.05)
+    sm = st.number_input("Split Mailu (proporción)", 0.0, 1.0, float(split_mailu), 0.05)
     if abs((sj + sm) - 1.0) > 1e-9:
         st.error("La suma debe ser 1.0 (100%).")
-    else:
-        if st.button("Guardar split", use_container_width=True, key="save_cfg_btn"):
-            cfg_ws.update("A1:B3", [
-                ["key","value"],
-                ["split_juan", sj],
-                ["split_mailu", sm]
-            ])
-            st.success("Split actualizado.")
+    elif st.button("Guardar split", use_container_width=True, key="save_cfg_btn"):
+        cfg_ws.update("A1:B3", [["key","value"], ["split_juan", sj], ["split_mailu", sm]])
+        st.success("Split actualizado.")
     st.divider()
     st.caption("Categorías: editá libremente la pestaña `categories` del Sheet (una por fila).")
