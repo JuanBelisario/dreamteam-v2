@@ -157,37 +157,49 @@ if page == "➕ Registrar":
 # ---- Split personalizado por gasto ----
 st.markdown("### 💰 Distribución del gasto")
 
+# Base dinámica según quién pagó
+is_juan_payer = paid_by == "Juan"
+
 col1, col2, col3 = st.columns([3, 1, 2])
 
-# Slider principal
+# Slider
 with col1:
-    perc_juan = st.slider(
-        "Juan (%)",
+    base_val = int(split_juan * 100) if is_juan_payer else int((1 - split_juan) * 100)
+    perc_value = st.slider(
+        f"{'Juan' if is_juan_payer else 'Mailu'} (%)",
         min_value=0,
         max_value=100,
-        value=int(split_juan * 100),
+        value=base_val,
         step=1,
-        key="juan_pct_slider",
+        key="split_slider",
         label_visibility="collapsed",
     )
 
-# Input manual (sincronizado)
+# Input manual
 with col2:
-    new_val = st.number_input(
+    perc_input = st.number_input(
         "Editar %",
         min_value=0,
         max_value=100,
-        value=perc_juan,
+        value=perc_value,
         step=1,
-        key="juan_pct_input",
+        key="split_input",
         label_visibility="collapsed",
     )
-    if new_val != perc_juan:
-        perc_juan = new_val
+    # Sincronización mutua
+    if perc_input != perc_value:
+        perc_value = perc_input
 
-# Mostrar ambos porcentajes siempre
-with col3:
+# Cálculo dinámico según quién pagó
+if is_juan_payer:
+    perc_juan = perc_value
     perc_mailu = 100 - perc_juan
+else:
+    perc_mailu = perc_value
+    perc_juan = 100 - perc_mailu
+
+# Muestra ambos valores
+with col3:
     st.markdown(
         f"""
         <div style='text-align:left;'>
@@ -197,6 +209,7 @@ with col3:
         """,
         unsafe_allow_html=True,
     )
+amount = st.number_input("Monto", min_value=0.0, step=0.01, format="%.2f")
 
 if st.button("Guardar ✅", use_container_width=True):
     ts = datetime.combine(dt, datetime.min.time())
