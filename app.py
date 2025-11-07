@@ -154,17 +154,48 @@ if page == "➕ Registrar":
     key="paid_for_radio",
     label_visibility="collapsed",
 )
-
+     # ---- Split personalizado por gasto ----
+st.write("**Distribución del gasto**")
+colj, colm = st.columns(2)
+with colj:
+    perc_juan = st.slider(
+        "Juan (%)",
+        min_value=0,
+        max_value=100,
+        value=int(split_juan * 100),
+        step=5,
+        key="juan_pct",
+    )
+with colm:
+    perc_mailu = 100 - perc_juan
+    st.metric("Mailu (%)", f"{perc_mailu}%")
+    
     mtype = st.selectbox("Tipo", ["gasto", "ingreso"])
     cat = st.selectbox("Categoría", categories)
     amount = st.number_input("Monto", min_value=0.0, step=100.0, format="%.2f")
     notes = st.text_input("Notas", "")
 
     if st.button("Guardar ✅", use_container_width=True):
-        ts = datetime.combine(dt, datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S")
-        row = [ts, who_am_i, paid_by, paid_for, mtype, cat, f"{amount:.2f}", notes]
-        append_transaction(tx_ws, row)
-        st.success("Movimiento registrado.")
+    ts = datetime.combine(dt, datetime.min.time())
+    amount_juan = amount * (perc_juan / 100)
+    amount_mailu = amount * (perc_mailu / 100)
+
+    row = {
+        "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_user": who_am_i,
+        "paid_by": paid_by,
+        "paid_for": paid_for,
+        "type": mtype,
+        "category": cat,
+        "amount": float(amount),
+        "notes": notes,
+        "split_juan": perc_juan / 100,
+        "split_mailu": perc_mailu / 100,
+        "amount_juan": amount_juan,
+        "amount_mailu": amount_mailu
+    }
+    append_transaction(row)
+    st.success("Movimiento registrado.")
 
     st.divider()
     st.caption("Tip: Podés agregar o quitar categorías desde la pestaña `categories` en el Sheet.")
