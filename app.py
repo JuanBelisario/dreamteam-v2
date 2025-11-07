@@ -157,8 +157,9 @@ if page == "➕ Registrar":
 # ---- Split personalizado por gasto ----
 st.markdown("### 💰 Distribución del gasto")
 
-col1, col2, col3 = st.columns([3, 1, 1])
+col1, col2, col3 = st.columns([3, 1, 2])
 
+# Slider principal
 with col1:
     perc_juan = st.slider(
         "Juan (%)",
@@ -170,8 +171,9 @@ with col1:
         label_visibility="collapsed",
     )
 
+# Input manual (sincronizado)
 with col2:
-    perc_input = st.number_input(
+    new_val = st.number_input(
         "Editar %",
         min_value=0,
         max_value=100,
@@ -180,12 +182,21 @@ with col2:
         key="juan_pct_input",
         label_visibility="collapsed",
     )
-    if perc_input != perc_juan:
-        perc_juan = perc_input  # sincroniza manual con slider
+    if new_val != perc_juan:
+        perc_juan = new_val
 
+# Mostrar ambos porcentajes siempre
 with col3:
     perc_mailu = 100 - perc_juan
-    st.metric(label="Mailu (%)", value=f"{perc_mailu}%", label_visibility="visible")
+    st.markdown(
+        f"""
+        <div style='text-align:left;'>
+            <b>Juan:</b> {perc_juan}%<br>
+            <b>Mailu:</b> {perc_mailu}%
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 if st.button("Guardar ✅", use_container_width=True):
     ts = datetime.combine(dt, datetime.min.time())
