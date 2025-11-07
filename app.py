@@ -209,7 +209,25 @@ with col3:
         """,
         unsafe_allow_html=True,
     )
+         # ---- Tipo y categoría ----
+st.markdown("### 📂 Tipo y categoría")
+
+mtype = st.selectbox(
+    "Tipo",
+    ["gasto", "ingreso"],
+    index=0,
+    key="mtype_select"
+)
+
+cat = st.selectbox(
+    "Categoría",
+    categorias,
+    index=0,
+    key="cat_select"
+)
+
 amount = st.number_input("Monto", min_value=0.0, step=0.01, format="%.2f")
+notes = st.text_area("Notas")
 
 if st.button("Guardar ✅", use_container_width=True):
     ts = datetime.combine(dt, datetime.min.time())
