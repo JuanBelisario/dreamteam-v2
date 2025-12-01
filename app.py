@@ -341,9 +341,9 @@ cat = st.radio(
 
 amount = st.number_input(
     f"Monto ({currency})",
-    min_value=0.0,
-    step=0.01,
-    format="%.2f",
+    min_value=0,
+    step=1,
+    format="%d",
 )
 notes = st.text_area("Notas")
 
