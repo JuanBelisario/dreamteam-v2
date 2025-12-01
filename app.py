@@ -1,4 +1,4 @@
-# Dreamteam v2 – Optimized Fast Load (with cache fix)
+# Dreamteam v2 – Optimized Fast Load (with cache fix + multi-moneda + simplificaciones)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -27,7 +27,7 @@ def open_sheet():
     sh = gc.open_by_key(st.secrets["general"]["sheet_id"])
     titles = [w.title for w in sh.worksheets()]
     if "transactions" not in titles:
-        sh.add_worksheet("transactions", rows=1000, cols=12)
+        sh.add_worksheet("transactions", rows=1000, cols=13)
     if "config" not in titles:
         sh.add_worksheet("config", rows=10, cols=2)
     if "categories" not in titles:
@@ -79,21 +79,62 @@ def read_categories_data(cat_values):
 
 @st.cache_data(ttl=60)
 def read_transactions_data(tx_values):
+    # Soportar falta de datos
     if not tx_values or len(tx_values) < 2:
         return pd.DataFrame(columns=[
             "timestamp","entry_user","paid_by","paid_for","type","category",
-            "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
+            "currency","amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
         ])
-    df = pd.DataFrame(tx_values[1:], columns=tx_values[0])
+
+    # Si la hoja todavía no tiene la columna currency en el header, la agregamos en memoria
+    header = tx_values[0]
+    if "currency" not in header:
+        header = header.copy()
+        # Insertamos "currency" después de "category" a nivel DataFrame
+        if "category" in header:
+            idx = header.index("category") + 1
+            header.insert(idx, "currency")
+        else:
+            header.append("currency")
+
+    # Rellenamos filas cortas con strings vacíos para que tengan el mismo largo que el header
+    fixed_rows = []
+    for row in tx_values[1:]:
+        r = row.copy()
+        if len(r) < len(header):
+            r.extend([""] * (len(header) - len(r)))
+        elif len(r) > len(header):
+            r = r[:len(header)]
+        fixed_rows.append(r)
+
+    df = pd.DataFrame(fixed_rows, columns=header)
+
+    # Defaults de tipos
     for col in ["amount", "amount_juan", "amount_mailu", "split_juan", "split_mailu"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    # Moneda: si no hay valor, asumimos ARS
+    if "currency" not in df.columns:
+        df["currency"] = "ARS"
+    else:
+        df["currency"] = df["currency"].replace("", "ARS").fillna("ARS")
+
     return df
 
 def append_transaction(tx_ws, row_dict):
     headers = _retry(lambda: tx_ws.row_values(1))
+    # Si la hoja aún no tiene currency en el header, lo agregamos en la primera fila
+    if "currency" not in headers:
+        # Insertamos en memoria y actualizamos header en Sheets
+        if "category" in headers:
+            idx = headers.index("category") + 1
+            headers.insert(idx, "currency")
+        else:
+            headers.append("currency")
+        _retry(lambda: tx_ws.update("A1", [headers]))
     ordered = [row_dict.get(h, "") for h in headers]
     _retry(lambda: tx_ws.append_row(ordered, value_input_option="USER_ENTERED"))
 
@@ -101,6 +142,7 @@ def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
     g = df[df["type"].str.lower() == "gasto"].copy()
     if g.empty:
         return 0.0, 0.0, 0.0
+
     def owed_parts(row):
         amt = float(row["amount"])
         pf = str(row.get("paid_for", "")).lower()
@@ -115,6 +157,7 @@ def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
         elif pf == "mailu":
             return 0.0, amt
         return amt * default_split_juan, amt * default_split_mailu
+
     g["owed_juan"], g["owed_mailu"] = zip(*g.apply(owed_parts, axis=1))
     g["paid_by_juan"] = (g["paid_by"].str.lower() == "juan").astype(float) * g["amount"]
     g["paid_by_mailu"] = (g["paid_by"].str.lower() == "mailu").astype(float) * g["amount"]
@@ -122,6 +165,19 @@ def compute_debt(df, default_split_juan=0.6, default_split_mailu=0.4):
     mailu_net = g["paid_by_mailu"].sum() - g["owed_mailu"].sum()
     mailu_owes_juan = max(0.0, juan_net)
     return juan_net, mailu_net, mailu_owes_juan
+
+# Pequeño wrapper por moneda
+def compute_debt_for_currency(df, currency, default_split_juan=0.6, default_split_mailu=0.4):
+    if "currency" not in df.columns:
+        # Por si acaso, todo se considera ARS
+        if currency == "ARS":
+            return compute_debt(df, default_split_juan, default_split_mailu)
+        else:
+            return 0.0, 0.0, 0.0
+    df_cur = df[df["currency"] == currency]
+    if df_cur.empty:
+        return 0.0, 0.0, 0.0
+    return compute_debt(df_cur, default_split_juan, default_split_mailu)
 
 # ---------- BOOTSTRAP ----------
 if "sheets" not in st.session_state:
@@ -134,7 +190,7 @@ cat_ws = sheets["cat"]
 
 TX_HEADERS = [
     "timestamp","entry_user","paid_by","paid_for","type","category",
-    "amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
+    "currency","amount","notes","split_juan","split_mailu","amount_juan","amount_mailu"
 ]
 if "tx_headers_ok" not in st.session_state:
     ensure_headers(tx_ws, TX_HEADERS)
@@ -153,29 +209,50 @@ df = read_transactions_data(tx_values)
 st.title("💸 Dreamteam v2")
 st.subheader("Nuevo movimiento")
 
-# Mostrar balance global arriba
-juan_net, mailu_net, mailu_owes_juan = compute_debt(df, split_juan, split_mailu)
-if mailu_owes_juan > 0:
-    st.success(f"💚 Mailu le debe a Juan: **${mailu_owes_juan:,.0f}**")
-elif juan_net < 0:
-    st.success(f"💚 Juan le debe a Mailu: **${abs(juan_net):,.0f}**")
-else:
-    st.info("⚖️ Están a mano.")
+# Mostrar balances separados por moneda
+col_bal_ars, col_bal_usd = st.columns(2)
 
+juan_net_ars, mailu_net_ars, mailu_owes_juan_ars = compute_debt_for_currency(
+    df, "ARS", split_juan, split_mailu
+)
+juan_net_usd, mailu_net_usd, mailu_owes_juan_usd = compute_debt_for_currency(
+    df, "USD", split_juan, split_mailu
+)
+
+with col_bal_ars:
+    st.markdown("**Balance en ARS**")
+    if mailu_owes_juan_ars > 0:
+        st.success(f"💚 Mailu le debe a Juan: **${mailu_owes_juan_ars:,.0f} ARS**")
+    elif juan_net_ars < 0:
+        st.success(f"💚 Juan le debe a Mailu: **${abs(juan_net_ars):,.0f} ARS**")
+    else:
+        st.info("⚖️ En ARS están a mano.")
+
+with col_bal_usd:
+    st.markdown("**Balance en USD**")
+    if mailu_owes_juan_usd > 0:
+        st.success(f"💚 Mailu le debe a Juan: **${mailu_owes_juan_usd:,.0f} USD**")
+    elif juan_net_usd < 0:
+        st.success(f"💚 Juan le debe a Mailu: **${abs(juan_net_usd):,.0f} USD**")
+    elif df[df["currency"] == "USD"].empty:
+        st.info("💸 Todavía no hay movimientos en USD.")
+    else:
+        st.info("⚖️ En USD están a mano.")
+
+# --- Fecha y moneda ---
 colA, colB = st.columns(2)
 with colA:
-    st.caption("¿Quién está cargando ahora?")
-    who_am_i = st.radio(
-        "¿Quién está cargando ahora?",
-        ["Juan", "Mailu"],
+    dt = st.date_input("Fecha", pd.Timestamp.now().date())
+with colB:
+    currency = st.radio(
+        "Moneda",
+        ["ARS", "USD"],
         horizontal=True,
         index=0,
-        key="who_am_i_radio",
-        label_visibility="collapsed",
+        key="currency_radio",
     )
-with colB:
-    dt = st.date_input("Fecha", pd.Timestamp.now().date())
 
+# --- Quién pagó ---
 st.write("**¿Quién pagó?**")
 paid_by = st.radio(
     "¿Quién pagó?",
@@ -186,15 +263,8 @@ paid_by = st.radio(
     label_visibility="collapsed",
 )
 
-st.write("**¿Para quién fue?**")
-paid_for = st.radio(
-    "¿Para quién fue?**",
-    ["Ambos", "Juan", "Mailu"],
-    horizontal=True,
-    index=0,
-    key="paid_for_radio",
-    label_visibility="collapsed",
-)
+# Eliminamos “¿Para quién fue?” → siempre ambos
+paid_for = "Ambos"
 
 # ---- Split por gasto (slider + input sincronizados) ----
 st.markdown("### 💰 Distribución del gasto")
@@ -256,22 +326,41 @@ with col3:
 
 # ---- Tipo, categoría, monto y notas ----
 st.markdown("### 📂 Tipo y categoría")
-mtype = st.selectbox("Tipo", ["gasto", "ingreso"], index=0, key="mtype_select")
-cat = st.selectbox("Categoría", categories, index=0, key="cat_select")
-amount = st.number_input("Monto", min_value=0.0, step=0.01, format="%.2f")
+
+# Tipo fijo: gasto
+mtype = "gasto"
+st.caption("Tipo: gasto (fijo)")
+
+# Categoría sin escritura: usamos radio en vez de selectbox
+cat = st.radio(
+    "Categoría",
+    categories,
+    index=0,
+    key="cat_radio",
+)
+
+amount = st.number_input(
+    f"Monto ({currency})",
+    min_value=0.0,
+    step=0.01,
+    format="%.2f",
+)
 notes = st.text_area("Notas")
 
 if st.button("Guardar ✅", use_container_width=True):
     ts = datetime.combine(dt, datetime.min.time())
     amount_juan = float(amount) * (perc_juan / 100)
     amount_mailu = float(amount) * (perc_mailu / 100)
+
     row = {
         "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-        "entry_user": who_am_i,
+        # quien registra ya no existe → usamos quien pagó como entry_user
+        "entry_user": paid_by,
         "paid_by": paid_by,
         "paid_for": paid_for,
         "type": mtype,
         "category": cat,
+        "currency": currency,
         "amount": float(amount),
         "notes": notes,
         "split_juan": perc_juan / 100,
@@ -283,4 +372,4 @@ if st.button("Guardar ✅", use_container_width=True):
     st.success("Movimiento registrado ✅")
 
 st.divider()
-st.caption("Podés editar categorías y splits desde el Sheet directamente.")
+st.caption("Podés editar categorías y splits globales desde el Sheet directamente.")
