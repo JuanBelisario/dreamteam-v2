@@ -341,7 +341,7 @@ cat = st.radio(
 
 amount = st.number_input(
     f"Monto ({currency})",
-    min_value=0,
+    min_value=0.0,
     step=0.01,
     format="%.2f",
 )
